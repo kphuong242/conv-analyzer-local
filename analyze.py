@@ -14,26 +14,29 @@ Usage:
     python analyze.py --call-id <uuid> [--prompt prompts/baseline.md] [--question "..."] [--note "..."]
 
 Outputs:
-    runs/<timestamp>__<call_id>__<prompt_name>.json — full input, prompt sha,
-    tool-call trace, final structured JSON, model + reasoning_effort, duration,
-    and a free-form `note` field for human grading.
+    runs/<call_id>__<prompt_name>__<ctx>__<ts>.json — full input, prompt
+    commit sha (gitops main), tool-call trace, final structured JSON,
+    model + reasoning_effort, duration, and a free-form `note` field for
+    human grading.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import openai
+import yaml
 from dotenv import load_dotenv
 
 from context_loaders import call_db, conv_graph, ticket
@@ -41,10 +44,19 @@ from mcp_clients import open_hub
 
 ROOT = Path(__file__).parent
 PROMPTS_DIR = ROOT / "prompts"
+GITOPS_PROMPTS_DIR = PROMPTS_DIR / "gitops"
+DEFAULT_PROMPT = GITOPS_PROMPTS_DIR / "conversation-analyzer.yaml"
+SYNC_SCRIPT = ROOT / "scripts" / "sync-prompt.sh"
 RUNS_DIR = ROOT / "runs"
 
 GRAFANA_TOOL_ALLOWLIST = {"query_loki_logs", "list_loki_label_names"}
 DB_TOOL_ALLOWLIST = {"prod_execute_sql"}
+
+# Run timestamps (started_at, trace entries, filename) are recorded in Paris
+# local time. Loki query times in context_loaders/call_db.py stay UTC because
+# Grafana / Loki interpret RFC3339 by offset — the harness's own logs being
+# local just makes them easier to skim.
+LOCAL_TZ = ZoneInfo("Europe/Paris")
 
 # Insertion order matters — loaders run in this order, and later loaders may
 # read earlier loaders' output via the shared `context` kwarg.
@@ -60,14 +72,14 @@ MANDATORY_LOADERS = {"call"}
 class TraceEntry:
     kind: str
     payload: Any
-    dt: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    dt: str = field(default_factory=lambda: datetime.now(LOCAL_TZ).isoformat())
 
 
 @dataclass
 class RunResult:
     call_id: str
     prompt_path: str
-    prompt_sha256: str
+    prompt_commit_sha: str | None
     model: str
     reasoning_effort: str
     context_loaders: list[str]
@@ -89,8 +101,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--call-id", required=True, help="UUID of the call to analyze.")
     p.add_argument(
         "--prompt",
-        default=str(PROMPTS_DIR / "baseline.md"),
-        help="Path to the system prompt file (default: prompts/baseline.md).",
+        default=str(DEFAULT_PROMPT),
+        help=(
+            "Path to the system prompt file. Supports .yaml (extracts "
+            "spec.declarative.systemMessage) and .md (raw). "
+            f"Default: {DEFAULT_PROMPT.relative_to(ROOT)} (auto-synced from gitops)."
+        ),
+    )
+    p.add_argument(
+        "--no-sync",
+        action="store_true",
+        help=(
+            "Skip the auto-sync from gitops before the run. "
+            "Only relevant when --prompt is inside prompts/gitops/."
+        ),
     )
     p.add_argument("--note", default="", help="Free-form note saved alongside the run output.")
     p.add_argument(
@@ -211,16 +235,39 @@ async def main() -> int:
         sys.stderr.write(f"missing env vars: {', '.join(missing)}\n")
         return 2
 
+    _log(
+        f"[init] call_id={args.call_id} model={model} "
+        f"reasoning={reasoning_effort} dry_run={args.dry_run}"
+    )
+
     prompt_path = Path(args.prompt).resolve()
+    if _is_gitops_prompt(prompt_path):
+        if args.no_sync:
+            _log("[sync] skipped (--no-sync)")
+        else:
+            _log("[sync] checking gitops for updates…")
+            _run_sync_prompt()
+    else:
+        rel_gitops = GITOPS_PROMPTS_DIR.relative_to(ROOT)
+        _log(f"[sync] skipped (prompt is outside {rel_gitops}/)")
     if not prompt_path.exists():
         sys.stderr.write(f"prompt file not found: {prompt_path}\n")
         return 2
-    system_prompt = prompt_path.read_text()
-    prompt_sha = hashlib.sha256(system_prompt.encode()).hexdigest()
+    system_prompt, prompt_commit_sha = load_prompt(prompt_path)
+    try:
+        prompt_rel = prompt_path.relative_to(ROOT)
+    except ValueError:
+        prompt_rel = prompt_path
+    _log(
+        f"[init] prompt: {prompt_rel} "
+        f"(commit={(prompt_commit_sha or 'none')[:8]}, "
+        f"chars={len(system_prompt)})"
+    )
 
     started_wall = time.monotonic()
     # Drop microseconds — filename uses the same instant and stays second-resolution.
-    started_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    started_iso = datetime.now(LOCAL_TZ).replace(microsecond=0).isoformat()
+    _log(f"[init] started_at={started_iso}")
 
     _log("[init] connecting to MCP servers (db-toolbox-prod, grafana-prod-vpn)…")
     async with open_hub(
@@ -283,7 +330,13 @@ async def main() -> int:
         }
 
         trace: list[TraceEntry] = []
-        trace.append(TraceEntry(kind="system", payload={"prompt_sha256": prompt_sha, "length": len(system_prompt)}))
+        trace.append(TraceEntry(
+            kind="system",
+            payload={
+                "prompt_commit_sha": prompt_commit_sha,
+                "length": len(system_prompt),
+            },
+        ))
         trace.append(TraceEntry(kind="user", payload=user_message))
 
         status: str | None = None
@@ -408,7 +461,7 @@ async def main() -> int:
         result = RunResult(
             call_id=args.call_id,
             prompt_path=str(prompt_path.relative_to(ROOT) if prompt_path.is_relative_to(ROOT) else prompt_path),
-            prompt_sha256=prompt_sha,
+            prompt_commit_sha=prompt_commit_sha,
             model=model,
             reasoning_effort=reasoning_effort,
             context_loaders=selected_loaders,
@@ -497,6 +550,52 @@ def save_run(result: RunResult, prompt_path: Path) -> Path:
     out_path = RUNS_DIR / f"{safe_call_id}__{prompt_name}{ctx_suffix}__{ts}.json"
     out_path.write_text(json.dumps(asdict(result), indent=2, default=str))
     return out_path
+
+
+def load_prompt(prompt_path: Path) -> tuple[str, str | None]:
+    """Return (system_prompt_text, source_sha).
+
+    - .yaml/.yml: parses spec.declarative.systemMessage from the kagent Agent yaml.
+    - any other extension: read as raw text.
+    - source_sha comes from a sibling .sha file (e.g. prompts/gitops/.sha), or None.
+    """
+    if prompt_path.suffix in (".yaml", ".yml"):
+        data = yaml.safe_load(prompt_path.read_text())
+        try:
+            text = data["spec"]["declarative"]["systemMessage"]
+        except (KeyError, TypeError) as e:
+            raise RuntimeError(
+                f"could not find spec.declarative.systemMessage in {prompt_path}: {e}"
+            ) from e
+        if not isinstance(text, str):
+            raise RuntimeError(
+                f"spec.declarative.systemMessage in {prompt_path} is not a string"
+            )
+    else:
+        text = prompt_path.read_text()
+
+    sha_path = prompt_path.parent / ".sha"
+    source_sha: str | None = None
+    if sha_path.is_file():
+        content = sha_path.read_text().strip()
+        source_sha = content or None
+    return text, source_sha
+
+
+def _is_gitops_prompt(prompt_path: Path) -> bool:
+    return prompt_path.is_relative_to(GITOPS_PROMPTS_DIR.resolve())
+
+
+def _run_sync_prompt() -> None:
+    if not SYNC_SCRIPT.exists():
+        _log(f"[sync] script not found at {SYNC_SCRIPT}; skipping")
+        return
+    try:
+        subprocess.run([str(SYNC_SCRIPT)], check=True)
+    except subprocess.CalledProcessError as e:
+        _log(f"[sync] failed (exit {e.returncode}); continuing with local copy")
+    except FileNotFoundError:
+        _log("[sync] bash not found; continuing with local copy")
 
 
 def _maybe_dump(obj: Any) -> Any:

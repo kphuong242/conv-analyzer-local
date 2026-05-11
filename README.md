@@ -8,25 +8,31 @@ without going through a kagent deploy cycle.
 
 Given a `call_id`, the script:
 
-1. Looks up the call row in the **production Postgres DB** via the
+1. Auto-syncs the latest `conversation-analyzer.yaml` from
+   `getvocal/gitops@main` (skip with `--no-sync`; see "Sync from gitops"
+   below). The local copy lives at `prompts/gitops/`.
+2. Looks up the call row in the **production Postgres DB** via the
    `db-toolbox-prod` MCP server (`prod_execute_sql`) to get `call_sid`,
    `dt_started`, `dt_ended`, `assistant_id`, `status`, etc.
-2. Derives a Loki time window (call duration ± `LOOKUP_BUFFER_MINUTES`).
-3. Loads a system prompt from `prompts/<name>.md`.
-4. Runs an OpenAI agent loop against that prompt — using the same model and
+3. Derives a Loki time window (call duration ± `LOOKUP_BUFFER_MINUTES`).
+4. Loads the system prompt. `.yaml` files have `spec.declarative.systemMessage`
+   extracted; `.md` files are read raw.
+5. Runs an OpenAI agent loop against that prompt — using the same model and
    reasoning effort the deployed kagent runs with (`gpt-5.4`,
    `reasoning_effort=high`) — exposing only the same Loki tools the kagent
    uses (`query_loki_logs`, `list_loki_label_names`) from the
    **grafana-prod-vpn** MCP server.
-5. Saves the full run — input context, prompt sha256, every tool call and
-   response, the final JSON, model, duration, and a free-form `note` — to
-   `runs/<timestamp>__<call_id>__<prompt_name>.json`.
+6. Saves the full run — input context, gitops commit sha, every tool call
+   and response, the final JSON, model, duration, and a free-form `note` —
+   to `runs/<call_id>__<prompt_name>__<ctx>__<ts>.json`.
 
 ## Requirements
 
 - VPN access to `internal.getvocal.ai` (both MCP servers are internal).
 - Python 3.11+.
 - `OPENAI_API_KEY`.
+- `gh` CLI authenticated against the `getvocal` org (for the auto-sync of
+  the gitops prompt). Skip with `--no-sync` if you don't have it.
 
 ## Provider parity with the deployed kagent
 
@@ -99,22 +105,88 @@ conversation-analyzer-eval/
 ├── mcp_clients.py          # MCP client wiring for both servers
 ├── context_loaders/
 │   ├── __init__.py
-│   └── call_db.py          # call lookup via db-toolbox-prod
+│   ├── call_db.py          # call lookup via db-toolbox-prod
+│   ├── conv_graph.py       # conv graph + transcript + analytics loader
+│   └── ticket.py           # ActionItems / tickets loader (eval-safe projection)
 ├── prompts/
-│   └── baseline.md         # verbatim copy of the deployed systemMessage
+│   ├── baseline.md         # extracted systemMessage, refreshed each sync (readable mirror)
+│   └── gitops/             # auto-synced from gitops main (default --prompt target)
+│       ├── conversation-analyzer.yaml
+│       └── .sha            # gitops commit at last sync
+├── scripts/
+│   └── sync-prompt.sh      # gh-based fetch of conversation-analyzer.yaml + sha
 └── runs/                   # per-run JSON outputs (gitignored)
+```
+
+## Sync from gitops
+
+The default `--prompt` is `prompts/gitops/conversation-analyzer.yaml`, the
+auto-synced copy of the deployed kagent Agent yaml in
+`getvocal/gitops/deployment/getvocal/kagent/agents/`. Every time you run
+`analyze.py` with a prompt under `prompts/gitops/`, it invokes
+`scripts/sync-prompt.sh` before loading the prompt:
+
+- On first run, `[sync] initial sync from gitops@<sha>` is printed.
+- When gitops `main` has new commits since your last sync,
+  `[sync] prompt updated <old-sha> -> <new-sha>` is printed and the local
+  files are overwritten. The run proceeds with the **new** prompt and the
+  new sha is recorded as `prompt_commit_sha` in `runs/*.json`.
+- When upstream hasn't moved, `[sync] gitops@<sha> (no change)` is printed.
+
+Each sync writes three files:
+- `prompts/gitops/conversation-analyzer.yaml` — full kagent Agent yaml.
+- `prompts/gitops/.sha` — gitops commit SHA at fetch time.
+- `prompts/baseline.md` — `spec.declarative.systemMessage` extracted from
+  the yaml, byte-identical to what the LLM sees. Read it to skim the
+  current deployed prompt without parsing yaml, or copy it as the starting
+  point for an experiment (`cp prompts/baseline.md prompts/my-test.md`).
+
+Manual sync (no run): `./scripts/sync-prompt.sh`.
+
+Skip auto-sync: pass `--no-sync` (useful when you're editing
+`prompts/gitops/conversation-analyzer.yaml` locally to test a prompt change
+without it being overwritten on the next run).
+
+If the sync fails (no network, `gh` unauth'd, etc.), the harness prints a
+warning to stderr and falls back to whatever local copy exists. It only
+hard-fails if the prompt file is missing entirely.
+
+To commit a synced prompt into this repo's history (e.g. you've reviewed
+runs against the new version and want it pinned):
+
+```bash
+git diff prompts/gitops/      # review what changed
+git add prompts/gitops/
+git commit -m "chore: sync prompt to gitops <short-sha>"
 ```
 
 ## Prompt versioning
 
-Prompts are plain markdown files. `baseline.md` is the verbatim copy of the
-deployed kagent's `systemMessage`. To iterate, copy it to a new file with a
-descriptive name (date + intent), edit, and pass `--prompt path/to/file.md`.
+Every run records `prompt_commit_sha` — the gitops `main` commit the prompt
+was synced from (read from the sibling `.sha` file). This is the same 40-char
+SHA you see on GitHub for that commit, so you can paste it into
+`github.com/getvocal/gitops/commit/<sha>` to view the exact prompt that
+produced a run.
+
+`prompt_commit_sha` is `null` for prompts not under `prompts/gitops/` (e.g.
+`baseline.md`, ad-hoc experiments). For those, the prompt filename + the
+full `system_prompt` text saved inside the trace are the identifier.
+
+To iterate on a new prompt without touching the gitops snapshot, copy
+`baseline.md` (or the synced yaml) to a new file and edit it. Anything
+under `prompts/` that is **not** inside `prompts/gitops/` is exempt from
+auto-sync, so your experimental file won't be overwritten:
+
+```bash
+cp prompts/baseline.md prompts/2026-05-12-tighter-search.md
+$EDITOR prompts/2026-05-12-tighter-search.md
+python analyze.py --call-id ... --prompt prompts/2026-05-12-tighter-search.md
+```
 
 The output filename is
 `runs/<call_id>__<prompt-stem>[__<optional-loaders>]__<YYYYMMDD-HHMMSS>.json`
 — call_id first for grepping by call, timestamp last at second resolution.
-Combined with `prompt_sha256` and `context_loaders` inside the run JSON,
+Combined with `prompt_commit_sha` and `context_loaders` inside the run JSON,
 every result is traceable to a specific prompt revision and context shape:
 
 - No optional context: `abc__baseline__20260511-143012.json`
@@ -122,10 +194,11 @@ every result is traceable to a specific prompt revision and context shape:
 - With multiple loaders: `abc__baseline__conv_graph+ticket__20260511-143012.json`
 
 The timestamp matches the `started_at` field in the run JSON exactly (same
-UTC instant, same second-level precision). The mandatory `call` loader is
-implicit and elided from the filename. If you tweak a prompt without
-renaming the file, the `prompt_sha256` field in `runs/` will diverge and
-let you tell runs apart.
+Paris-local instant, same second-level precision). The mandatory `call`
+loader is implicit and elided from the filename. If you re-sync mid-day
+and gitops has moved, the `prompt_commit_sha` field in `runs/*.json` will
+diverge and let you tell runs apart even when the filename and call_id
+match.
 
 ## Selectable context loaders
 
