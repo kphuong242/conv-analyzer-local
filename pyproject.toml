@@ -1,0 +1,14 @@
+[project]
+name = "conversation-analyzer-eval"
+version = "0.1.0"
+description = "Local harness for iterating on the conversation-analyzer kagent prompt."
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.60.0",
+    "mcp>=1.2.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.27.0",
+]
+
+[tool.ruff]
+line-length = 120
