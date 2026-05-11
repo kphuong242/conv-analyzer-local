@@ -73,6 +73,12 @@ python analyze.py --call-id 0193abcd-... --context conv_graph \
     --question "agent kept asking the same question" \
     --note "graph context A/B"
 
+# Pull in any existing ActionItems (tickets) attached to this call:
+python analyze.py --call-id 0193abcd-... --context ticket
+
+# Stack multiple contexts:
+python analyze.py --call-id 0193abcd-... --context conv_graph,ticket
+
 # Iterate on a new prompt:
 cp prompts/baseline.md prompts/2026-05-07-tighter-search.md
 $EDITOR prompts/2026-05-07-tighter-search.md
@@ -105,17 +111,21 @@ Prompts are plain markdown files. `baseline.md` is the verbatim copy of the
 deployed kagent's `systemMessage`. To iterate, copy it to a new file with a
 descriptive name (date + intent), edit, and pass `--prompt path/to/file.md`.
 
-The output filename — `runs/<utc-ts>__<call_id>__<prompt-stem>[__<optional-loaders>].json` —
-plus `prompt_sha256` and `context_loaders` inside the run JSON make every
-result traceable to a specific prompt revision and context shape:
+The output filename is
+`runs/<call_id>__<prompt-stem>[__<optional-loaders>]__<YYYYMMDD-HHMMSS>.json`
+— call_id first for grepping by call, timestamp last at second resolution.
+Combined with `prompt_sha256` and `context_loaders` inside the run JSON,
+every result is traceable to a specific prompt revision and context shape:
 
-- No optional context: `20260507T130612Z__abc__baseline.json`
-- With graph context: `20260507T130612Z__abc__baseline__conv_graph.json`
-- With multiple loaders: `20260507T130612Z__abc__baseline__conv_graph+ticket.json`
+- No optional context: `abc__baseline__20260511-143012.json`
+- With graph context: `abc__baseline__conv_graph__20260511-143012.json`
+- With multiple loaders: `abc__baseline__conv_graph+ticket__20260511-143012.json`
 
-The mandatory `call` loader is implicit and elided from the filename. If
-you tweak a prompt without renaming the file, the `prompt_sha256` field in
-`runs/` will diverge and let you tell runs apart.
+The timestamp matches the `started_at` field in the run JSON exactly (same
+UTC instant, same second-level precision). The mandatory `call` loader is
+implicit and elided from the filename. If you tweak a prompt without
+renaming the file, the `prompt_sha256` field in `runs/` will diverge and
+let you tell runs apart.
 
 ## Selectable context loaders
 
@@ -138,6 +148,9 @@ python analyze.py --call-id 0193abcd-... --context conv_graph,ticket
 
 - **`call`** (mandatory) — id, call_sid, conv_graph_id, dt_started/ended, telecom_provider, status, language. Derives the Loki time window.
 - **`conv_graph`** (optional) — given the call's `conv_graph_id`, fetches the slim graph (nodes, edges, action-node IDs), the call's `conversation_transcript`, and the pre-computed `conv_graph_analytics` blob if it's been treated. This is the loader that lets the analyzer support tags it can't decide from logs alone (`graph_translation_issue`, `same_questions_several_times`, `agent_not_ending_the_conversation`, `action_node_error`, `conversation_not_starting`).
+- **`ticket`** (optional) — pulls every `ActionItems` row whose `call_or_conversation_id` matches the target call (the platform's per-call ticket records), ordered newest first. Returns `{title, description, status, priority, tags, responsible_team, dt_*, comments, sub_tasks, ...}` per ticket. Two filters are applied to comments before they reach the model:
+  - `type != "comment"` entries are dropped. nexus writes every audit-trail event ("changed status from X to Y", sub-task edits, owner reassignments) as `type="log"`; those entries are workflow metadata, not analyst input. Count surfaces as `dropped_log_comments` per ticket and `total_dropped_log_comments` overall.
+  - Comments that cross-reference *other* calls (any UUID in the body that isn't the target call_id) are dropped — operators often link sibling calls in threads, and that noise drags the model's attention away from this call's symptoms. Count surfaces as `dropped_cross_reference_comments` per ticket and `total_dropped_cross_reference_comments` overall.
 
 ### Adding a new loader
 

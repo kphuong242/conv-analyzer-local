@@ -36,7 +36,7 @@ from typing import Any
 import openai
 from dotenv import load_dotenv
 
-from context_loaders import call_db, conv_graph
+from context_loaders import call_db, conv_graph, ticket
 from mcp_clients import open_hub
 
 ROOT = Path(__file__).parent
@@ -51,6 +51,7 @@ DB_TOOL_ALLOWLIST = {"prod_execute_sql"}
 LOADER_REGISTRY = {
     "call": call_db.load,
     "conv_graph": conv_graph.load,
+    "ticket": ticket.load,
 }
 MANDATORY_LOADERS = {"call"}
 
@@ -218,7 +219,8 @@ async def main() -> int:
     prompt_sha = hashlib.sha256(system_prompt.encode()).hexdigest()
 
     started_wall = time.monotonic()
-    started_iso = datetime.now(timezone.utc).isoformat()
+    # Drop microseconds — filename uses the same instant and stays second-resolution.
+    started_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
     _log("[init] connecting to MCP servers (db-toolbox-prod, grafana-prod-vpn)…")
     async with open_hub(
@@ -478,7 +480,6 @@ def build_user_message(call_id: str, context: dict[str, Any], question: str) -> 
 
 def save_run(result: RunResult, prompt_path: Path) -> Path:
     RUNS_DIR.mkdir(exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     prompt_name = prompt_path.stem
     safe_call_id = result.call_id.replace("/", "_")
 
@@ -488,7 +489,12 @@ def save_run(result: RunResult, prompt_path: Path) -> Path:
     optional = [k for k in result.context_loaders if k not in MANDATORY_LOADERS]
     ctx_suffix = f"__{'+'.join(optional)}" if optional else ""
 
-    out_path = RUNS_DIR / f"{ts}__{safe_call_id}__{prompt_name}{ctx_suffix}.json"
+    # Filename order: call_id → prompt → optional loaders → timestamp.
+    # Timestamp is at second resolution and derived from `started_at` so the
+    # filename matches the run's recorded start time exactly.
+    ts = datetime.fromisoformat(result.started_at).strftime("%Y%m%d-%H%M%S")
+
+    out_path = RUNS_DIR / f"{safe_call_id}__{prompt_name}{ctx_suffix}__{ts}.json"
     out_path.write_text(json.dumps(asdict(result), indent=2, default=str))
     return out_path
 
