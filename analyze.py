@@ -39,6 +39,7 @@ import openai
 import yaml
 from dotenv import load_dotenv
 
+import code_tools
 from context_loaders import call_db, conv_graph, ticket
 from mcp_clients import open_hub
 
@@ -47,6 +48,7 @@ PROMPTS_DIR = ROOT / "prompts"
 GITOPS_PROMPTS_DIR = PROMPTS_DIR / "gitops"
 DEFAULT_PROMPT = GITOPS_PROMPTS_DIR / "conversation-analyzer.yaml"
 SYNC_SCRIPT = ROOT / "scripts" / "sync-prompt.sh"
+SYNC_CODE_REPOS_SCRIPT = ROOT / "scripts" / "sync-code-repos.py"
 RUNS_DIR = ROOT / "runs"
 
 GRAFANA_TOOL_ALLOWLIST = {"query_loki_logs", "list_loki_label_names"}
@@ -67,6 +69,10 @@ LOADER_REGISTRY = {
 }
 MANDATORY_LOADERS = {"call"}
 
+# Optional features that aren't data loaders — they toggle extra tools
+# exposed to the model. Selected via the same --context flag for uniformity.
+OPTIONAL_TOOL_FEATURES = {"code"}
+
 
 @dataclass
 class TraceEntry:
@@ -83,6 +89,8 @@ class RunResult:
     model: str
     reasoning_effort: str
     context_loaders: list[str]
+    code_tools_enabled: bool
+    tool_usage: dict[str, int]
     started_at: str
     duration_seconds: float
     context: dict[str, Any]
@@ -116,6 +124,14 @@ def parse_args() -> argparse.Namespace:
             "Only relevant when --prompt is inside prompts/gitops/."
         ),
     )
+    p.add_argument(
+        "--no-code-sync",
+        action="store_true",
+        help=(
+            "Skip the auto-sync of code-repos/ before the run. "
+            "Only relevant when --context code is enabled."
+        ),
+    )
     p.add_argument("--note", default="", help="Free-form note saved alongside the run output.")
     p.add_argument(
         "--question",
@@ -139,15 +155,17 @@ def parse_args() -> argparse.Namespace:
         help="Load context only; print the user message and tool list, then exit without invoking OpenAI.",
     )
     p.add_argument("-q", "--quiet", action="store_true", help="Suppress progress lines on stderr.")
-    optional_loaders = sorted(set(LOADER_REGISTRY) - MANDATORY_LOADERS)
+    optional = sorted((set(LOADER_REGISTRY) - MANDATORY_LOADERS) | OPTIONAL_TOOL_FEATURES)
     p.add_argument(
         "--context",
         default="",
         help=(
-            f"Comma-separated optional context loaders to include. "
-            f"Available: {', '.join(optional_loaders) or '(none)'}. "
+            f"Comma-separated optional features to enable for this run. "
+            f"Available: {', '.join(optional) or '(none)'}. "
+            f"Loaders inject data into the user message; tool features "
+            f"(e.g. 'code') expose extra tools to the model. "
             f"Mandatory loaders ({', '.join(sorted(MANDATORY_LOADERS))}) always run. "
-            f"Example: --context conv_graph"
+            f"Example: --context conv_graph,code"
         ),
     )
     return p.parse_args()
@@ -172,6 +190,51 @@ def _human_bytes(n: int) -> str:
     if n < 1024 * 1024:
         return f"{n / 1024:.1f} kB"
     return f"{n / (1024 * 1024):.2f} MB"
+
+
+def _tool_tag(name: str) -> str:
+    """Short marker indicating which subsystem a tool belongs to."""
+    if name in code_tools.DISPATCH:
+        return "code"
+    if name in GRAFANA_TOOL_ALLOWLIST:
+        return "loki"
+    return "mcp"
+
+
+def _format_usage(usage: dict[str, int]) -> str:
+    """Group tool usage by tag for a readable summary."""
+    by_tag: dict[str, dict[str, int]] = {}
+    for name, count in sorted(usage.items()):
+        tag = _tool_tag(name)
+        by_tag.setdefault(tag, {})[name] = count
+    parts: list[str] = []
+    for tag in ("loki", "code", "mcp"):
+        if tag in by_tag:
+            inner = ", ".join(f"{n}={c}" for n, c in by_tag[tag].items())
+            total = sum(by_tag[tag].values())
+            parts.append(f"{tag}={total} ({inner})")
+    return "; ".join(parts) if parts else "(no tool calls)"
+
+
+def _sync_code_repos() -> None:
+    """Run scripts/sync-code-repos.py inline.
+
+    Warns (not fails) on errors. The `code_tools.available()` check that
+    follows is what hard-stops the run if code-repos/ ends up empty.
+    """
+    if not SYNC_CODE_REPOS_SCRIPT.exists():
+        _log(f"[sync] {SYNC_CODE_REPOS_SCRIPT.relative_to(ROOT)} not found — skipping code sync")
+        return
+    try:
+        result = subprocess.run(
+            [sys.executable, str(SYNC_CODE_REPOS_SCRIPT)],
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        _log("[sync] code sync timed out after 120s — proceeding with existing code-repos/")
+        return
+    if result.returncode != 0:
+        _log(f"[sync] code sync exited {result.returncode} — proceeding with existing code-repos/")
 
 
 def _count_loki_lines(out: str) -> int | None:
@@ -279,16 +342,29 @@ async def main() -> int:
         _log(f"[init] connected — {len(hub.tools)} MCP tool(s) available")
 
         extra = {x.strip() for x in args.context.split(",") if x.strip()}
-        unknown = extra - LOADER_REGISTRY.keys()
+        unknown = extra - LOADER_REGISTRY.keys() - OPTIONAL_TOOL_FEATURES
         if unknown:
-            sys.stderr.write(
-                f"unknown context loaders: {sorted(unknown)} "
-                f"(available: {sorted(LOADER_REGISTRY)})\n"
-            )
+            available = sorted(LOADER_REGISTRY.keys() | OPTIONAL_TOOL_FEATURES)
+            sys.stderr.write(f"unknown --context names: {sorted(unknown)} (available: {available})\n")
             return 2
-        to_run = MANDATORY_LOADERS | extra
+
+        loader_extra = extra & LOADER_REGISTRY.keys()
+        to_run = MANDATORY_LOADERS | loader_extra
         selected_loaders = [k for k in LOADER_REGISTRY if k in to_run]
         _log(f"[init] context loaders: {selected_loaders}")
+
+        code_tools_enabled = "code" in extra
+        if code_tools_enabled:
+            if args.no_code_sync:
+                _log("[sync] code-repos sync skipped (--no-code-sync)")
+            else:
+                _sync_code_repos()
+        if code_tools_enabled and not code_tools.available():
+            sys.stderr.write(
+                "[error] --context code requested but no repos under code-repos/. "
+                "Run: python scripts/sync-code-repos.py\n"
+            )
+            return 2
 
         context: dict[str, Any] = {}
         for key in selected_loaders:
@@ -311,16 +387,24 @@ async def main() -> int:
 
         user_message = build_user_message(args.call_id, context, args.question)
 
+        if code_tools_enabled:
+            _log(f"[init] code-reading tools enabled — repos: {code_tools._available_repos()}")
+
         if args.dry_run:
             print(user_message)
             print("\n--- tools exposed to the model ---")
             for t in hub.tools:
                 if t.server == "grafana-prod-vpn":
-                    print(f"- {t.name}")
+                    print(f"- {t.name} (grafana-prod-vpn)")
+            if code_tools_enabled:
+                for t in code_tools.TOOLS:
+                    print(f"- {t['name']} (local)")
             return 0
 
         client = openai.OpenAI(api_key=api_key)
         tools_payload = [t.to_openai() for t in hub.tools if t.server == "grafana-prod-vpn"]
+        if code_tools_enabled:
+            tools_payload.extend(code_tools.TOOLS)
         common_kwargs = {
             "model": model,
             "tools": tools_payload,
@@ -343,6 +427,7 @@ async def main() -> int:
         final_text = ""
         iterations = 0
         error: str | None = None
+        tool_usage: dict[str, int] = {}
 
         try:
             iterations += 1
@@ -397,10 +482,16 @@ async def main() -> int:
                     except json.JSONDecodeError:
                         tool_args = {}
                     requested_limit = tool_args.get("limit") if isinstance(tool_args, dict) else None
-                    _log(f"[turn {iterations}]   → {fc.name}({_summarise_args(tool_args)})")
+                    tag = _tool_tag(fc.name)
+                    tool_usage[fc.name] = tool_usage.get(fc.name, 0) + 1
+                    _log(f"[turn {iterations}]   → [{tag}] {fc.name}({_summarise_args(tool_args)})")
                     t_tool = time.monotonic()
                     try:
-                        out = await hub.call_tool(fc.name, tool_args)
+                        if fc.name in code_tools.DISPATCH:
+                            kwargs = tool_args if isinstance(tool_args, dict) else {}
+                            out = await code_tools.DISPATCH[fc.name](**kwargs)
+                        else:
+                            out = await hub.call_tool(fc.name, tool_args)
                     except Exception as e:  # noqa: BLE001
                         out = f"[tool dispatch error] {type(e).__name__}: {e}"
                     tool_dt = time.monotonic() - t_tool
@@ -416,12 +507,12 @@ async def main() -> int:
                         else:
                             lines_str = f"{line_count} lines"
                         _log(
-                            f"[turn {iterations}]   ← {fc.name}: {lines_str}, "
+                            f"[turn {iterations}]   ← [{tag}] {fc.name}: {lines_str}, "
                             f"{_human_bytes(out_bytes)} in {tool_dt:.1f}s"
                         )
                     else:
                         _log(
-                            f"[turn {iterations}]   ← {fc.name}: "
+                            f"[turn {iterations}]   ← [{tag}] {fc.name}: "
                             f"{_human_bytes(out_bytes)} in {tool_dt:.1f}s"
                         )
 
@@ -465,6 +556,8 @@ async def main() -> int:
             model=model,
             reasoning_effort=reasoning_effort,
             context_loaders=selected_loaders,
+            code_tools_enabled=code_tools_enabled,
+            tool_usage=tool_usage,
             started_at=started_iso,
             duration_seconds=round(time.monotonic() - started_wall, 3),
             context=context,
@@ -484,6 +577,7 @@ async def main() -> int:
             f"[done] {iterations} turn(s), {result.duration_seconds:.1f}s total, "
             f"status={status} → {rel}"
         )
+        _log(f"[done] tool usage: {_format_usage(tool_usage)}")
         print(f"\nrun saved to: {out_path}")
         if final_json is not None:
             print(json.dumps(final_json, indent=2, default=str))
@@ -536,11 +630,13 @@ def save_run(result: RunResult, prompt_path: Path) -> Path:
     prompt_name = prompt_path.stem
     safe_call_id = result.call_id.replace("/", "_")
 
-    # Encode the optional context loaders into the filename so two runs of the
+    # Encode the optional features into the filename so two runs of the
     # same prompt against the same call but with different context are easy to
     # tell apart at a glance. Mandatory loaders are implicit and elided.
-    optional = [k for k in result.context_loaders if k not in MANDATORY_LOADERS]
-    ctx_suffix = f"__{'+'.join(optional)}" if optional else ""
+    features = [k for k in result.context_loaders if k not in MANDATORY_LOADERS]
+    if result.code_tools_enabled:
+        features.append("code")
+    ctx_suffix = f"__{'+'.join(features)}" if features else ""
 
     # Filename order: call_id → prompt → optional loaders → timestamp.
     # Timestamp is at second resolution and derived from `started_at` so the

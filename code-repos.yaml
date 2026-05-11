@@ -1,0 +1,41 @@
+# Repos that the conversation analyzer is allowed to read.
+#
+# Edit this list, then run:
+#     python scripts/sync-code-repos.py
+#
+# Clones land in `code-repos/<name>/` inside this project (gitignored) —
+# fully separate from your wider workspace checkouts, which are never
+# touched by the sync script. The same `<name>` is what the analyzer's
+# code-reading tools will use to address a repo.
+#
+# `depth` defaults to 1 (shallow). Raise it per-repo if you need git-log
+# or blame history for that repo.
+
+repos:
+  - name: SmartCaller
+    url: git@github.com:getvocal/SmartCaller.git
+    branch: main
+
+  - name: nexus
+    url: git@github.com:getvocal/nexus.git
+    branch: main
+
+  - name: datamodel
+    url: git@github.com:getvocal/datamodel.git
+    branch: main
+
+  - name: gitops
+    url: git@github.com:getvocal/gitops.git
+    branch: main
+
+  - name: taskrunner
+    url: git@github.com:getvocal/taskrunner.git
+    branch: main
+
+  - name: multimodal
+    url: git@github.com:getvocal/multimodal.git
+    branch: main
+
+  - name: utils
+    url: git@github.com:getvocal/utils.git
+    branch: main
