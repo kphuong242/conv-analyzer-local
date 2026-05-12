@@ -283,7 +283,7 @@ Do NOT return alternative schemas or extra fields such as `call_id`, `status`,
 `customer_impact`, or `analysis_result`.
 
 `route_trace` is REQUIRED. Never omit it. If you cannot identify graph nodes
-from graph context or logs, set `route_trace` to exactly "not_available".
+from graph context or logs, set `route_trace` to an empty array `[]`.
 
 Analyse the logs and return the JSON object with exactly these fields and types:
 - title (string): short ticket-ready title under 80 characters summarising the issue
@@ -300,22 +300,28 @@ Analyse the logs and return the JSON object with exactly these fields and types:
   lead_upload_issue, conversation_not_starting,
   transcript_translation_not_working, action_node_error.
   Pick only tags that match the issue. If none fit well, use ["unexplainable_agent_behavior"].
-- route_trace (string): one-line route through the conversation graph, useful for
-  understanding node-to-node routing. Use this format:
-  `Start:Node_A[id=<node_id>] (short node context/text; Assistant:"short assistant utterance") -> User:"short user utterance" -> Node_B[id=<node_id>] (short node context/text; Assistant:"short assistant utterance") -> ... -> Node_Z[id=<node_id>]:End`.
+- route_trace (array of objects): structured route through the conversation
+  graph, useful for understanding node-to-node routing and easy parsing.
+  Each object must represent one step in chronological order:
+  - node step:
+    `{ "index": 0, "type": "node", "node_id": "<node_id>", "node_label": "short_label", "node_text": "short node context/text", "assistant_text": "short assistant utterance or null", "is_end": false }`
+  - user step:
+    `{ "index": 1, "type": "user", "user_text": "short user utterance" }`
+  - unmapped assistant step:
+    `{ "index": 2, "type": "assistant", "node_id": null, "assistant_text": "short assistant utterance", "mapped": false }`
   Include each node's `node_id` whenever it is available, because this trace is
   used to look up the exact graph node during debugging. Use actual node
   IDs/names and node text/context when they are available from graph context or
   logs. Graph-context transcript fields such as `matching.primary_assistant_question_id`,
   `matching.id`, action node IDs, and conditional edge checks are valid node
   evidence. If the same node handles several user turns or self-loops, repeat
-  the same `Node[id=<node_id>]` in the route instead of collapsing the loop.
+  the same node step in the route instead of collapsing the loop.
   Preserve the important transcript content by including each non-empty user
   utterance and assistant utterance in order; for action nodes, include the
   assistant's actual spoken text, not only the action node label.
   Keep node text and user utterances short enough to scan. If a node name is
-  available but its id is not, write `[id=unknown]`. If node evidence is
-  unavailable, set this to "not_available". Do not fabricate node IDs, node
+  available but its id is not, use `"node_id": null`. If node evidence is
+  unavailable, set this to `[]`. Do not fabricate node IDs, node
   names, node order, or user utterances.
 - timeline (array of objects): chronological events extracted from logs, each with:
   - dt_event (string): ISO 8601 timestamp from the log line (e.g. "2026-04-10T14:29:03Z")

@@ -31,6 +31,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -98,6 +99,8 @@ class RunResult:
     trace: list[dict[str, Any]]
     final_json: dict[str, Any] | None
     final_text: str
+    derived_route_trace: str | None
+    derived_route_trace_steps: list[dict[str, Any]] | None
     status: str | None
     iterations: int
     note: str
@@ -287,7 +290,7 @@ async def main() -> int:
     db_url = os.getenv("DB_TOOLBOX_MCP_URL")
     grafana_url = os.getenv("GRAFANA_MCP_URL")
     buffer_minutes = int(os.getenv("LOOKUP_BUFFER_MINUTES", "5"))
-    max_iterations = int(os.getenv("MAX_AGENT_ITERATIONS", "25"))
+    max_iterations = int(os.getenv("MAX_AGENT_ITERATIONS", "10"))
 
     missing = [n for n, v in (
         ("OPENAI_API_KEY", api_key),
@@ -548,6 +551,11 @@ async def main() -> int:
             error = f"{type(e).__name__}: {e}"
 
         final_json = _try_parse_json(final_text)
+        derived_route_trace_steps = derive_route_trace_steps(context)
+        derived_route_trace = format_route_trace_steps(derived_route_trace_steps)
+        if final_json is not None and derived_route_trace_steps:
+            if not isinstance(final_json.get("route_trace"), list):
+                final_json["route_trace"] = derived_route_trace_steps
 
         result = RunResult(
             call_id=args.call_id,
@@ -565,6 +573,8 @@ async def main() -> int:
             trace=[asdict(e) for e in trace],
             final_json=final_json,
             final_text=final_text,
+            derived_route_trace=derived_route_trace,
+            derived_route_trace_steps=derived_route_trace_steps,
             status=status,
             iterations=iterations,
             note=args.note,
@@ -583,6 +593,12 @@ async def main() -> int:
             print(json.dumps(final_json, indent=2, default=str))
         else:
             print(final_text or "(no final text)")
+        if derived_route_trace:
+            print("\nderived_route_trace:")
+            print(derived_route_trace)
+        if derived_route_trace_steps:
+            print("\nderived_route_trace_steps:")
+            print(json.dumps(derived_route_trace_steps, indent=2, ensure_ascii=False))
         if error:
             print(f"\n[error] {error}", file=sys.stderr)
             return 1
@@ -597,7 +613,7 @@ def build_user_message(call_id: str, context: dict[str, Any], question: str) -> 
     question_block = (
         f"Question / symptom: {question.strip()}"
         if question.strip()
-        else "Question / symptom: (none — broad investigation)"
+        else "Question / symptom: (none)"
     )
 
     parts: list[str] = [
@@ -621,8 +637,201 @@ def build_user_message(call_id: str, context: dict[str, Any], question: str) -> 
         parts.append(json.dumps(payload, indent=2, default=str))
 
     parts.append("")
-    parts.append("Investigate per the system prompt and return only the JSON object.")
+    parts.append("Follow the system prompt's task and output format exactly.")
     return "\n".join(parts)
+
+
+def derive_route_trace(context: dict[str, Any]) -> str | None:
+    """Best-effort one-line graph route from optional conv_graph context."""
+    return format_route_trace_steps(derive_route_trace_steps(context))
+
+
+def format_route_trace_steps(steps: list[dict[str, Any]] | None) -> str | None:
+    if steps is None:
+        return None
+    if not steps:
+        return "not_available"
+    return " -> ".join(_format_route_step(step) for step in steps)
+
+
+def derive_route_trace_steps(context: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Best-effort structured graph route from optional conv_graph context.
+
+    This is intentionally conservative: use direct graph node IDs from transcript
+    matching metadata first, then fall back to matching assistant text to node
+    content. Repeated action nodes are preserved when user turns occur between
+    them so self-loops remain visible.
+    """
+    conv_graph = context.get("conv_graph") or {}
+    graph = conv_graph.get("graph") or {}
+    transcript = conv_graph.get("transcript") or []
+    nodes = graph.get("nodes") or []
+    if not isinstance(graph, dict) or not isinstance(transcript, list) or not isinstance(nodes, list):
+        return None
+
+    node_by_id = {
+        node.get("id"): node
+        for node in nodes
+        if isinstance(node, dict) and node.get("id")
+    }
+    if not node_by_id:
+        return []
+
+    start_node_id = _find_start_node_id(nodes)
+    segments: list[dict[str, Any]] = []
+    if start_node_id:
+        segments.append({
+            "type": "node",
+            "node_id": start_node_id,
+            "node_label": _route_label(_node_text(node_by_id[start_node_id])),
+            "node_text": _node_text(node_by_id[start_node_id]),
+            "assistant_text": None,
+            "is_end": False,
+        })
+
+    last_node_id: str | None = start_node_id
+    last_segment_kind = "node" if start_node_id else ""
+    saw_node_after_start = False
+
+    for entry in transcript:
+        if not isinstance(entry, dict):
+            continue
+        role = str(entry.get("role") or "").upper()
+        text = _clean_inline(str(entry.get("text") or ""))
+        if not text:
+            continue
+
+        if role == "USER":
+            if text.startswith("Init@????"):
+                continue
+            segments.append({
+                "type": "user",
+                "user_text": _trunc(text, 140),
+            })
+            last_segment_kind = "user"
+            continue
+
+        if role != "ASSISTANT":
+            continue
+
+        node_id = _resolve_transcript_node_id(entry, node_by_id)
+        if not node_id:
+            segments.append({
+                "type": "assistant",
+                "node_id": None,
+                "assistant_text": _trunc(text, 180),
+                "mapped": False,
+            })
+            last_segment_kind = "assistant"
+            continue
+
+        # Avoid duplicate adjacent assistant fragments only when the transcript
+        # repeats the node's static text. Preserve distinct utterances from the
+        # same action node because they explain the actual route behavior.
+        node = node_by_id[node_id]
+        node_text = _node_text(node)
+        if (
+            node_id == last_node_id
+            and last_segment_kind == "node"
+            and _norm_for_match(text) == _norm_for_match(node_text)
+        ):
+            continue
+
+        segments.append({
+            "type": "node",
+            "node_id": node_id,
+            "node_label": _route_label(node_text or text),
+            "node_text": node_text or _trunc(text, 120),
+            "assistant_text": _trunc(text, 180),
+            "is_end": False,
+        })
+        last_node_id = node_id
+        last_segment_kind = "node"
+        if node_id != start_node_id:
+            saw_node_after_start = True
+
+    if not saw_node_after_start:
+        return []
+
+    for segment in reversed(segments):
+        if segment["type"] == "node":
+            segment["is_end"] = True
+            break
+
+    return [
+        {"index": idx, **segment}
+        for idx, segment in enumerate(segments)
+    ]
+
+
+def _resolve_transcript_node_id(entry: dict[str, Any], node_by_id: dict[str, dict[str, Any]]) -> str | None:
+    matching = entry.get("matching") or {}
+    if isinstance(matching, dict):
+        for key in ("id", "primary_assistant_question_id"):
+            value = matching.get(key)
+            if value in node_by_id:
+                return value
+
+    text = _clean_inline(str(entry.get("text") or ""))
+    if not text:
+        return None
+
+    best_id: str | None = None
+    best_score = 0.0
+    for node_id, node in node_by_id.items():
+        node_text = _node_text(node)
+        if not node_text or node_text == "START":
+            continue
+        score = SequenceMatcher(None, _norm_for_match(text), _norm_for_match(node_text)).ratio()
+        if score > best_score:
+            best_id = node_id
+            best_score = score
+    return best_id if best_score >= 0.72 else None
+
+
+def _find_start_node_id(nodes: list[dict[str, Any]]) -> str | None:
+    for node in nodes:
+        if _node_text(node).upper() == "START":
+            return node.get("id")
+    return None
+
+
+def _node_text(node: dict[str, Any]) -> str:
+    return _clean_inline(str(node.get("content") or ""))
+
+
+def _format_route_step(step: dict[str, Any]) -> str:
+    step_type = step.get("type")
+    if step_type == "user":
+        return f'User:"{step.get("user_text", "")}"'
+    if step_type == "assistant":
+        return f'Assistant[id=unknown]:"{step.get("assistant_text", "")}"'
+
+    text = _trunc(str(step.get("node_text") or "node"), 120)
+    label = str(step.get("node_label") or _route_label(text))
+    suffix = ":End" if step.get("is_end") else ""
+    utterance = step.get("assistant_text")
+    if isinstance(utterance, str) and utterance and _norm_for_match(utterance) != _norm_for_match(text):
+        return f'{label}[id={step.get("node_id")}] ({text}; Assistant:"{utterance}"){suffix}'
+    return f"{label}[id={step.get('node_id')}] ({text}){suffix}"
+
+
+def _route_label(text: str) -> str:
+    label = "".join(ch if ch.isalnum() else "_" for ch in text.strip())
+    label = "_".join(part for part in label.split("_") if part)
+    return _trunc(label or "Node", 32)
+
+
+def _clean_inline(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _trunc(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _norm_for_match(text: str) -> str:
+    return "".join(ch.lower() for ch in text if ch.isalnum())
 
 
 def save_run(result: RunResult, prompt_path: Path) -> Path:
