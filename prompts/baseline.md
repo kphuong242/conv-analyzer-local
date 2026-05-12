@@ -270,8 +270,22 @@ the cited line if they want detail.
 When analyzing, build a chronological timeline of events from the log timestamps.
 Focus your analysis around the user's question — what they asked about is what matters most.
 
-Analyse the logs and return ONLY a JSON object (no markdown fences, no extra text)
-with exactly these fields and types:
+FINAL OUTPUT CONTRACT — mandatory:
+Return ONLY one valid JSON object. No markdown fences, no explanation outside
+the JSON, and no extra top-level keys.
+
+The JSON object MUST contain exactly these top-level keys, in this order:
+`title`, `summary`, `team_recommendation`, `reasoning`, `tags`,
+`route_trace`, `timeline`.
+
+Do NOT return alternative schemas or extra fields such as `call_id`, `status`,
+`root_cause`, `findings`, `evidence`, `next_steps`, `confidence`,
+`customer_impact`, or `analysis_result`.
+
+`route_trace` is REQUIRED. Never omit it. If you cannot identify graph nodes
+from graph context or logs, set `route_trace` to exactly "not_available".
+
+Analyse the logs and return the JSON object with exactly these fields and types:
 - title (string): short ticket-ready title under 80 characters summarising the issue
   (e.g. "Call failed during assistant initialization", "Latency spike in TTS provider")
 - summary (string): one-paragraph description of what happened
@@ -286,6 +300,23 @@ with exactly these fields and types:
   lead_upload_issue, conversation_not_starting,
   transcript_translation_not_working, action_node_error.
   Pick only tags that match the issue. If none fit well, use ["unexplainable_agent_behavior"].
+- route_trace (string): one-line route through the conversation graph, useful for
+  understanding node-to-node routing. Use this format:
+  `Start:Node_A[id=<node_id>] (short node context/text; Assistant:"short assistant utterance") -> User:"short user utterance" -> Node_B[id=<node_id>] (short node context/text; Assistant:"short assistant utterance") -> ... -> Node_Z[id=<node_id>]:End`.
+  Include each node's `node_id` whenever it is available, because this trace is
+  used to look up the exact graph node during debugging. Use actual node
+  IDs/names and node text/context when they are available from graph context or
+  logs. Graph-context transcript fields such as `matching.primary_assistant_question_id`,
+  `matching.id`, action node IDs, and conditional edge checks are valid node
+  evidence. If the same node handles several user turns or self-loops, repeat
+  the same `Node[id=<node_id>]` in the route instead of collapsing the loop.
+  Preserve the important transcript content by including each non-empty user
+  utterance and assistant utterance in order; for action nodes, include the
+  assistant's actual spoken text, not only the action node label.
+  Keep node text and user utterances short enough to scan. If a node name is
+  available but its id is not, write `[id=unknown]`. If node evidence is
+  unavailable, set this to "not_available". Do not fabricate node IDs, node
+  names, node order, or user utterances.
 - timeline (array of objects): chronological events extracted from logs, each with:
   - dt_event (string): ISO 8601 timestamp from the log line (e.g. "2026-04-10T14:29:03Z")
   - service (string): which service produced this log (caller, chat-engine, transcribe-audio, tts)
